@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   MapContainer,
   TileLayer,
@@ -7,6 +7,7 @@ import {
   Popup,
   CircleMarker,
   useMap,
+  useMapEvents,
 } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -31,13 +32,13 @@ L.Marker.prototype.options.icon = DefaultIcon
 // Mocked road network with realistic curved segments (polyline chunks per street)
 // Each segment contains: coordinates, street name, speed (km/h), safety score 0-100
 const roadNetwork = {
-  // Simple grid-like but with curves
   streets: [
     {
       id: 'A',
       name: 'Aurora Ave',
       segments: [
         {
+          id: 'A1',
           coords: [
             [37.776, -122.424],
             [37.7765, -122.421],
@@ -50,6 +51,7 @@ const roadNetwork = {
           lanes: 2,
         },
         {
+          id: 'A2',
           coords: [
             [37.7772, -122.416],
             [37.7783, -122.4135],
@@ -67,6 +69,7 @@ const roadNetwork = {
       name: 'Beacon St',
       segments: [
         {
+          id: 'B1',
           coords: [
             [37.7745, -122.419],
             [37.7752, -122.417],
@@ -78,6 +81,7 @@ const roadNetwork = {
           lanes: 1,
         },
         {
+          id: 'B2',
           coords: [
             [37.776, -122.4145],
             [37.777, -122.412],
@@ -95,6 +99,7 @@ const roadNetwork = {
       name: 'Cobalt Blvd',
       segments: [
         {
+          id: 'C1',
           coords: [
             [37.7735, -122.4235],
             [37.773, -122.421],
@@ -106,6 +111,7 @@ const roadNetwork = {
           lanes: 3,
         },
         {
+          id: 'C2',
           coords: [
             [37.7725, -122.418],
             [37.772, -122.4155],
@@ -129,8 +135,6 @@ const roadNetwork = {
   ],
 }
 
-// Mock route definitions that snap to the road network by referencing segments.
-// Each route uses ordered segments to ensure realistic curvy polylines following roads.
 const routeOptions = [
   { key: 'fastest', label: 'Fastest', color: '#0ea5e9' },
   { key: 'safest', label: 'Safest', color: '#10b981' },
@@ -157,12 +161,10 @@ function haversineDistance(a, b) {
   return R * c
 }
 
-// Build a route path by concatenating segment coords
 function buildPath(segments) {
   const path = []
   segments.forEach((seg, idx) => {
     seg.coords.forEach((pt, i) => {
-      // Avoid duplicate point when joining
       if (idx > 0 && i === 0) return
       path.push(pt)
     })
@@ -170,11 +172,9 @@ function buildPath(segments) {
   return path
 }
 
-function estimateDistanceMeters(path) {
+function pathDistance(path) {
   let total = 0
-  for (let i = 0; i < path.length - 1; i++) {
-    total += haversineDistance(path[i], path[i + 1])
-  }
+  for (let i = 0; i < path.length - 1; i++) total += haversineDistance(path[i], path[i + 1])
   return total
 }
 
@@ -216,19 +216,18 @@ function FitBounds({ path }) {
 }
 
 function LaneGuidance({ path }) {
-  // Render subtle arrows along the path to simulate lane guidance
   const map = useMap()
   useEffect(() => {
     if (!path || path.length < 2) return
     const decorators = []
     const icon = L.divIcon({
-      html: '<div style="transform: translate(-50%, -50%) rotate(0deg); color:#111;">➤</div>',
+      html: '<div style="transform: translate(-50%, -50%); color:#111; font-size:16px">➤</div>',
       className: 'lane-arrow',
     })
 
     for (let i = 0; i < path.length - 1; i += 3) {
       const mid = path[i]
-      const marker = L.marker(mid, { icon, interactive: false, opacity: 0.6 })
+      const marker = L.marker(mid, { icon, interactive: false, opacity: 0.7 })
       marker.addTo(map)
       decorators.push(marker)
     }
@@ -238,14 +237,15 @@ function LaneGuidance({ path }) {
   return null
 }
 
-function RouteJournal({ steps, total, etaMin, profile }) {
+function RouteJournal({ steps, total, etaMin, profile, safetyAvg }) {
   return (
-    <div className="h-full overflow-y-auto space-y-3">
+    <div className="h-full overflow-y-auto space-y-3" id="journal">
       <div className="p-3 rounded-md bg-slate-900/60 text-slate-100">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm uppercase tracking-wider text-slate-400">{profile.label} Route</div>
             <div className="text-xl font-semibold">{(total / 1000).toFixed(2)} km • {Math.round(etaMin)} min</div>
+            <div className="text-xs text-emerald-300">Avg safety {Math.round(safetyAvg)} / 100</div>
           </div>
           <div className="text-xs text-slate-400">Mocked</div>
         </div>
@@ -264,81 +264,301 @@ function RouteJournal({ steps, total, etaMin, profile }) {
   )
 }
 
+function FloatingManeuver({ nextPoint, label }) {
+  const map = useMap()
+  const [pos, setPos] = useState(null)
+  useEffect(() => {
+    if (!nextPoint) return
+    const update = () => {
+      const p = map.latLngToContainerPoint(L.latLng(nextPoint))
+      setPos({ left: p.x, top: p.y })
+    }
+    update()
+    const onMove = () => update()
+    map.on('move zoom', onMove)
+    return () => {
+      map.off('move', onMove)
+      map.off('zoom', onMove)
+    }
+  }, [map, nextPoint])
+  if (!nextPoint || !pos) return null
+  return (
+    <div className="absolute z-[600]" style={{ left: pos.left, top: pos.top }}>
+      <div className="-translate-x-1/2 -translate-y-full bg-slate-900 text-white text-xs px-2 py-1 rounded shadow">
+        {label}
+      </div>
+    </div>
+  )
+}
+
+function useSpeech() {
+  const speak = useCallback((text) => {
+    try {
+      const synth = window.speechSynthesis
+      if (!synth) return
+      const utter = new SpeechSynthesisUtterance(text)
+      utter.rate = 1
+      synth.cancel()
+      synth.speak(utter)
+    } catch (e) {
+      // noop for environments without speech
+    }
+  }, [])
+  return { speak }
+}
+
 export default function MapView() {
   const [start] = useState([37.7745, -122.423])
   const [end] = useState([37.7782, -122.4095])
   const [profileKey, setProfileKey] = useState('balanced')
 
-  // Build route candidates by selecting different segment sets
-  const routes = useMemo(() => {
+  // Live conditions: per-segment dynamic modifiers (speed, safety, crowd)
+  const [conditions, setConditions] = useState(() => {
+    const obj = {}
+    roadNetwork.streets.forEach((st) =>
+      st.segments.forEach((seg) => {
+        obj[seg.id] = { speedFactor: 1, safetyAdj: 0, crowd: 0.3 }
+      })
+    )
+    return obj
+  })
+
+  // User preferences
+  const [prefs, setPrefs] = useState({ avoidBusy: 0.4, preferLit: 0.6, comfort: 0.6 })
+  const [horizon, setHorizon] = useState(15) // minutes
+
+  // "GPS" simulated progress along active route
+  const [progress, setProgress] = useState({ idx: 0, t: 0 }) // path index
+  const [simOn, setSimOn] = useState(true)
+
+  // Previous route for comparisons
+  const [prevRoute, setPrevRoute] = useState(null)
+  const [suggestion, setSuggestion] = useState(null)
+  const [showCompare, setShowCompare] = useState(false)
+
+  const { speak } = useSpeech()
+
+  // Prepare route candidates (fixed segment sequences that follow roads exactly)
+  const baseCandidates = useMemo(() => {
     const A = roadNetwork.streets.find((s) => s.id === 'A')
     const B = roadNetwork.streets.find((s) => s.id === 'B')
     const C = roadNetwork.streets.find((s) => s.id === 'C')
 
-    const fastestSegs = [C.segments[0], C.segments[1], A.segments[1]]
-    const safestSegs = [B.segments[0], B.segments[1]]
-    const balancedSegs = [A.segments[0], B.segments[0], B.segments[1]]
-    const nightSegs = [A.segments[0], A.segments[1]]
-    const femaleSegs = [B.segments[0], A.segments[1]]
+    // Attach parent street name for convenience
+    const withName = (seg, name) => ({ ...seg, name })
 
-    const catalog = {
-      fastest: fastestSegs,
-      safest: safestSegs,
-      balanced: balancedSegs,
-      night: nightSegs,
-      female: femaleSegs,
-    }
+    const fastestSegs = [withName(C.segments[0], 'Cobalt Blvd'), withName(C.segments[1], 'Cobalt Blvd'), withName(A.segments[1], 'Aurora Ave')]
+    const safestSegs = [withName(B.segments[0], 'Beacon St'), withName(B.segments[1], 'Beacon St')]
+    const balancedSegs = [withName(A.segments[0], 'Aurora Ave'), withName(B.segments[0], 'Beacon St'), withName(B.segments[1], 'Beacon St')]
+    const nightSegs = [withName(A.segments[0], 'Aurora Ave'), withName(A.segments[1], 'Aurora Ave')]
+    const femaleSegs = [withName(B.segments[0], 'Beacon St'), withName(A.segments[1], 'Aurora Ave')]
 
-    const make = (key) => {
-      const segs = catalog[key]
-      const path = buildPath(segs)
-      const total = estimateDistanceMeters(path)
-      // Mock ETA using average of segment speeds and penalties
-      const avgSpeedKmh =
-        segs.reduce((acc, s) => acc + s.speed, 0) / Math.max(segs.length, 1)
-      const etaHours = total / 1000 / Math.max(avgSpeedKmh, 1)
-      const penalty = key === 'safest' ? 1.15 : key === 'night' ? 1.1 : key === 'female' ? 1.12 : 1
-      const etaMin = (etaHours * 60) * penalty
-
-      // Steps based on segment changes
-      const steps = segs.map((s, i) => ({
-        instruction:
-          i === 0
-            ? 'Head onto ' + (s.name || 'current road')
-            : 'Continue along ' + (s.name || 'the road'),
-        street: s.name || 'Unnamed',
-        distance: estimateDistanceMeters(s.coords),
-        note:
-          s.safety >= 75
-            ? 'Well-lit area with cameras'
-            : s.safety <= 45
-            ? 'Low visibility, avoid late hours'
-            : undefined,
-      }))
-
-      // Safety segments for per-segment color
-      const colored = segs.map((s) => ({ coords: s.coords, color: routeSafetyColor(s.safety) }))
-
-      return { key, segs, path, total, etaMin, steps, colored }
-    }
-
-    const routesObj = {
-      fastest: make('fastest'),
-      safest: make('safest'),
-      balanced: make('balanced'),
-      night: make('night'),
-      female: make('female'),
-    }
-
-    return routesObj
+    return [
+      { key: 'fastest', segs: fastestSegs },
+      { key: 'safest', segs: safestSegs },
+      { key: 'balanced', segs: balancedSegs },
+      { key: 'night', segs: nightSegs },
+      { key: 'female', segs: femaleSegs },
+    ]
   }, [])
 
-  const profile = routeOptions.find((r) => r.key === profileKey)
+  // Mock AI predictor: returns predicted multipliers for each segment in next horizon mins
+  const predict = useCallback((segId, horizonMin) => {
+    // Deterministic-ish pseudo prediction using segId hash
+    const seed = segId.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
+    const phase = (Math.sin((Date.now() / 100000 + seed) % Math.PI) + 1) / 2
+    const congestion = 0.9 + 0.3 * phase * (horizonMin / 30) // 0.9..1.2
+    const risk = -5 + 15 * phase * (horizonMin / 30) // -5..+10
+    const lightingPenalty = segId.startsWith('C') ? 8 : segId.startsWith('A') ? 2 : 0
+    return { speedFactor: 1 / congestion, safetyAdj: risk - lightingPenalty }
+  }, [])
+
+  // Score and compute metrics for a candidate considering current conditions, AI prediction, and prefs
+  const evaluate = useCallback((candidate) => {
+    const segs = candidate.segs
+    // Build path
+    const path = buildPath(segs)
+
+    // Aggregate metrics
+    let totalMeters = 0
+    let totalTimeH = 0
+    let safetySum = 0
+    let crowdSum = 0
+
+    const steps = segs.map((s, i) => {
+      const dist = pathDistance(s.coords)
+      totalMeters += dist
+
+      const cond = conditions[s.id] || { speedFactor: 1, safetyAdj: 0, crowd: 0.3 }
+      const pred = predict(s.id, horizon)
+
+      const effSpeed = Math.max(5, s.speed * cond.speedFactor * pred.speedFactor) // km/h
+      const timeH = (dist / 1000) / effSpeed
+      totalTimeH += timeH
+
+      const effSafety = Math.max(0, Math.min(100, s.safety + cond.safetyAdj + pred.safetyAdj))
+      safetySum += effSafety * dist
+
+      const crowd = cond.crowd
+      crowdSum += crowd * dist
+
+      return {
+        instruction: i === 0 ? `Head onto ${s.name}` : `Continue along ${s.name}`,
+        street: s.name,
+        distance: dist,
+        safety: effSafety,
+        note: effSafety >= 75 ? 'Well-lit area with cameras' : effSafety <= 45 ? 'Low visibility, avoid late hours' : undefined,
+      }
+    })
+
+    const avgSafety = safetySum / Math.max(totalMeters, 1)
+    const avgCrowd = crowdSum / Math.max(totalMeters, 1)
+
+    // Preference weighting
+    // Higher score is better: penalize time and crowd, reward safety
+    const timeMin = totalTimeH * 60
+    const score = (avgSafety / 100) * (0.5 + prefs.preferLit * 0.5) -
+                  (timeMin / 30) * (0.5 + (1 - prefs.comfort) * 0.5) -
+                  avgCrowd * prefs.avoidBusy * 0.8
+
+    const colored = segs.map((s) => {
+      const cond = conditions[s.id] || { safetyAdj: 0 }
+      const pred = predict(s.id, horizon)
+      const eff = Math.max(0, Math.min(100, s.safety + cond.safetyAdj + pred.safetyAdj))
+      return { coords: s.coords, color: routeSafetyColor(eff) }
+    })
+
+    return {
+      key: candidate.key,
+      segs,
+      path,
+      total: totalMeters,
+      etaMin: timeMin,
+      steps,
+      colored,
+      avgSafety,
+      avgCrowd,
+      score,
+    }
+  }, [conditions, horizon, prefs, predict])
+
+  // Compute all candidates
+  const routes = useMemo(() => {
+    const r = {}
+    baseCandidates.forEach((c) => {
+      r[c.key] = evaluate(c)
+    })
+    return r
+  }, [baseCandidates, evaluate])
+
   const active = routes[profileKey]
+  const profile = routeOptions.find((r) => r.key === profileKey) || { label: 'Route' }
+
+  // Simulate live conditions update every 6 seconds
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setConditions((prev) => {
+        const next = { ...prev }
+        Object.keys(next).forEach((id) => {
+          const jitter = (n) => Math.max(0.7, Math.min(1.3, (next[id].speedFactor + (Math.random() - 0.5) * 0.1)))
+          const crowd = Math.max(0, Math.min(1, next[id].crowd + (Math.random() - 0.5) * 0.1))
+          const safetyAdj = Math.max(-20, Math.min(20, next[id].safetyAdj + (Math.random() - 0.5) * 2))
+          next[id] = { speedFactor: jitter(), crowd, safetyAdj }
+        })
+        return next
+      })
+    }, 6000)
+    return () => clearInterval(iv)
+  }, [])
+
+  // Detect if a better route exists -> suggest change
+  useEffect(() => {
+    const best = Object.values(routes).reduce((a, b) => (a.score > b.score ? a : b))
+    if (!active || !best) return
+    if (best.key !== active.key) {
+      // compute deltas
+      const timeSaved = Math.max(0, active.etaMin - best.etaMin)
+      const safetyGain = Math.max(0, best.avgSafety - active.avgSafety)
+      setSuggestion({ best, timeSaved, safetyGain })
+    } else {
+      setSuggestion(null)
+    }
+  }, [routes, active])
+
+  // Simulate movement along active route
+  const progressRef = useRef(progress)
+  useEffect(() => { progressRef.current = progress }, [progress])
+  useEffect(() => {
+    if (!simOn || !active || active.path.length < 2) return
+    let raf
+    const step = () => {
+      const cur = progressRef.current
+      // advance based on an approximate speed derived from ETA
+      const points = active.path
+      const totalTimeMs = active.etaMin * 60 * 1000
+      const dt = 250 // ms per frame
+      const idxInc = Math.max(1, Math.round((points.length / (totalTimeMs / dt))))
+      const nextIdx = Math.min(points.length - 1, cur.idx + idxInc)
+      setProgress({ idx: nextIdx, t: Date.now() })
+      raf = setTimeout(step, dt)
+    }
+    raf = setTimeout(step, 300)
+    return () => clearTimeout(raf)
+  }, [active, simOn])
+
+  // Determine upcoming maneuver at segment boundary
+  const maneuvers = useMemo(() => {
+    const arr = []
+    baseCandidates.find((c) => c.key === active.key)?.segs.forEach((s, i, list) => {
+      if (i < list.length - 1) {
+        const nextStart = list[i + 1].coords[0]
+        arr.push({ point: nextStart, label: `Then continue to ${list[i + 1].name}` })
+      }
+    })
+    return arr
+  }, [active, baseCandidates])
+
+  const currentManeuver = useMemo(() => {
+    if (!active) return null
+    const idx = progress.idx
+    // find closest maneuver point ahead
+    let best = null
+    maneuvers.forEach((m) => {
+      // approximate by index distance on path
+      const nearestIndex = active.path.findIndex((p) => p[0] === m.point[0] && p[1] === m.point[1])
+      if (nearestIndex > idx && (best === null || nearestIndex < best.nearestIndex)) best = { ...m, nearestIndex }
+    })
+    return best
+  }, [maneuvers, progress.idx, active])
+
+  // Voice when approaching maneuver
+  const voicedRef = useRef({})
+  useEffect(() => {
+    if (!currentManeuver || !active) return
+    const distanceAhead = (function () {
+      let d = 0
+      for (let i = progress.idx; i < Math.min(currentManeuver.nearestIndex, active.path.length - 1); i++) {
+        d += haversineDistance(active.path[i], active.path[i + 1])
+      }
+      return d
+    })()
+    if (distanceAhead < 80 && !voicedRef.current[currentManeuver.nearestIndex]) {
+      speak(currentManeuver.label)
+      voicedRef.current[currentManeuver.nearestIndex] = true
+    }
+  }, [currentManeuver, progress.idx, active, speak])
+
+  const acceptSuggestion = () => {
+    if (!suggestion) return
+    setPrevRoute(active)
+    setProfileKey(suggestion.best.key)
+    setShowCompare(true)
+    setSuggestion(null)
+  }
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4">
-      <div className="relative h-[520px] lg:h-[640px] rounded-xl overflow-hidden shadow ring-1 ring-slate-200">
+      <div className="relative h-[560px] lg:h-[680px] rounded-xl overflow-hidden shadow ring-1 ring-slate-200">
         <MapContainer center={[37.7755, -122.418]} zoom={14} scrollWheelZoom className="h-full w-full">
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
 
@@ -349,9 +569,14 @@ export default function MapView() {
             <Popup>Destination</Popup>
           </Marker>
 
+          {/* Old route comparison overlay */}
+          {showCompare && prevRoute && (
+            <Polyline positions={prevRoute.path} pathOptions={{ color: '#94a3b8', weight: 4, opacity: 0.8, dashArray: '6 6' }} />
+          )}
+
           {/* Draw per-segment safety colored polylines for active route */}
           {active.colored.map((c, idx) => (
-            <Polyline key={idx} positions={c.coords} pathOptions={{ color: c.color, weight: 6, opacity: 0.9 }} />
+            <Polyline key={idx} positions={c.coords} pathOptions={{ color: c.color, weight: 6, opacity: 0.95 }} />
           ))}
 
           {/* Render all intersections with traffic signals */}
@@ -362,10 +587,20 @@ export default function MapView() {
 
           {/* Fit bounds to active route */}
           <FitBounds path={active.path} />
+
+          {/* Simulated user position */}
+          <Marker position={active.path[Math.min(progress.idx, active.path.length - 1)]}>
+            <Popup>You are here (simulated)</Popup>
+          </Marker>
+
+          {/* Floating maneuver callout anchored to next turn */}
+          {currentManeuver && (
+            <FloatingManeuver nextPoint={currentManeuver.point} label={currentManeuver.label} />
+          )}
         </MapContainer>
 
         {/* Route selector overlay */}
-        <div className="absolute top-3 left-3 flex flex-wrap gap-2 z-[500]">
+        <div className="absolute top-3 left-3 flex flex-wrap gap-2 z-[700]">
           {routeOptions.map((r) => (
             <button
               key={r.key}
@@ -383,21 +618,69 @@ export default function MapView() {
           ))}
         </div>
 
-        {/* Warnings/legend overlay */}
-        <div className="absolute bottom-3 left-3 z-[500] bg-white/90 backdrop-blur border border-slate-200 rounded-lg p-3 text-sm text-slate-700 shadow">
+        {/* Live alert suggestions */}
+        {suggestion && (
+          <div className="absolute top-3 right-3 z-[700] max-w-xs">
+            <div className="bg-white/95 border border-slate-200 rounded-lg shadow p-3">
+              <div className="text-sm font-semibold">Conditions changed</div>
+              <div className="text-xs text-slate-600 mt-1">We found a better route.</div>
+              <div className="flex items-center justify-between text-sm mt-2">
+                <div className="pr-3 border-r">
+                  <div className="text-slate-500">Time saved</div>
+                  <div className="font-semibold">{Math.max(0, Math.round(suggestion.timeSaved))} min</div>
+                </div>
+                <div className="pl-3">
+                  <div className="text-slate-500">Safety +</div>
+                  <div className="font-semibold">{Math.round((suggestion.safetyGain / Math.max(active.avgSafety, 1)) * 100)}%</div>
+                </div>
+              </div>
+              <div className="flex gap-2 mt-3">
+                <button onClick={acceptSuggestion} className="px-3 py-1.5 rounded-md bg-slate-900 text-white text-sm">Switch</button>
+                <button onClick={() => setShowCompare((s) => !s)} className="px-3 py-1.5 rounded-md bg-slate-100 text-slate-700 text-sm border">
+                  {showCompare ? 'Hide compare' : 'Compare'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Legend */}
+        <div className="absolute bottom-3 left-3 z-[700] bg-white/90 backdrop-blur border border-slate-200 rounded-lg p-3 text-sm text-slate-700 shadow">
           <div className="font-semibold mb-1">Legend</div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
             <div className="flex items-center gap-1"><span className="w-3 h-1.5 rounded-sm bg-emerald-500 inline-block" /> High safety</div>
             <div className="flex items-center gap-1"><span className="w-3 h-1.5 rounded-sm bg-amber-500 inline-block" /> Medium</div>
             <div className="flex items-center gap-1"><span className="w-3 h-1.5 rounded-sm bg-red-500 inline-block" /> Low</div>
             <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-red-500 inline-block" /> Signal</div>
           </div>
         </div>
+
+        {/* Preferences panel */}
+        <div className="absolute bottom-3 right-3 z-[700] bg-white/95 backdrop-blur border border-slate-200 rounded-lg p-3 text-sm text-slate-700 shadow w-[260px]">
+          <div className="font-semibold mb-2">Preferences</div>
+          <label className="block text-xs text-slate-500">Avoid busy roads: {(prefs.avoidBusy*100).toFixed(0)}%</label>
+          <input type="range" min="0" max="1" step="0.05" value={prefs.avoidBusy} onChange={(e)=>setPrefs((p)=>({ ...p, avoidBusy: parseFloat(e.target.value) }))} className="w-full" />
+          <label className="block text-xs text-slate-500 mt-2">Prefer well-lit streets: {(prefs.preferLit*100).toFixed(0)}%</label>
+          <input type="range" min="0" max="1" step="0.05" value={prefs.preferLit} onChange={(e)=>setPrefs((p)=>({ ...p, preferLit: parseFloat(e.target.value) }))} className="w-full" />
+          <label className="block text-xs text-slate-500 mt-2">Comfort level</label>
+          <div className="flex items-center gap-2">
+            <input type="range" min="0" max="1" step="0.25" value={prefs.comfort} onChange={(e)=>setPrefs((p)=>({ ...p, comfort: parseFloat(e.target.value) }))} className="w-full" />
+            <span className="text-xs w-14 text-right">{prefs.comfort < 0.34 ? 'Low' : prefs.comfort < 0.67 ? 'Medium' : 'High'}</span>
+          </div>
+          <label className="block text-xs text-slate-500 mt-3">Predict next (min): {horizon}</label>
+          <input type="range" min="5" max="30" step="5" value={horizon} onChange={(e)=>setHorizon(parseInt(e.target.value))} className="w-full" />
+          <div className="flex items-center justify-between mt-2">
+            <button className={`text-xs px-2 py-1 rounded border ${simOn ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white'}`} onClick={()=>setSimOn((v)=>!v)}>
+              {simOn ? 'Sim ON' : 'Sim OFF'}
+            </button>
+            <button className="text-xs px-2 py-1 rounded border" onClick={()=>setShowCompare((s)=>!s)}>{showCompare ? 'Hide compare' : 'Show compare'}</button>
+          </div>
+        </div>
       </div>
 
       {/* Route journal side panel */}
-      <div className="h-[520px] lg:h-[640px] rounded-xl overflow-hidden bg-gradient-to-b from-slate-50 to-white border border-slate-200 shadow p-4">
-        <RouteJournal steps={active.steps} total={active.total} etaMin={active.etaMin} profile={profile} />
+      <div className="h-[560px] lg:h-[680px] rounded-xl overflow-hidden bg-gradient-to-b from-slate-50 to-white border border-slate-200 shadow p-4">
+        <RouteJournal steps={active.steps} total={active.total} etaMin={active.etaMin} profile={profile} safetyAvg={active.avgSafety} />
       </div>
     </div>
   )
