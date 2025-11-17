@@ -204,14 +204,15 @@ function TrafficSignalsLayer({ intersections }) {
   ))
 }
 
-function FitBounds({ path }) {
+function FitBounds({ path, extraPoints = [] }) {
   const map = useMap()
   useEffect(() => {
-    if (path && path.length > 0) {
-      const bounds = L.latLngBounds(path)
+    const pts = [...(path || []), ...extraPoints]
+    if (pts && pts.length > 0) {
+      const bounds = L.latLngBounds(pts)
       map.fitBounds(bounds, { padding: [40, 40] })
     }
-  }, [path, map])
+  }, [path, extraPoints, map])
   return null
 }
 
@@ -307,9 +308,20 @@ function useSpeech() {
   return { speak }
 }
 
+function ClickSetter({ onSet }) {
+  useMapEvents({
+    click(e) {
+      const { lat, lng } = e.latlng
+      onSet([lat, lng])
+    },
+  })
+  return null
+}
+
 export default function MapView() {
-  const [start] = useState([37.7745, -122.423])
-  const [end] = useState([37.7782, -122.4095])
+  const [start, setStart] = useState([37.7745, -122.423])
+  const [end, setEnd] = useState([37.7782, -122.4095])
+  const [selectionMode, setSelectionMode] = useState('none') // 'start' | 'end' | 'none'
   const [profileKey, setProfileKey] = useState('balanced')
 
   // Live conditions: per-segment dynamic modifiers (speed, safety, crowd)
@@ -556,16 +568,40 @@ export default function MapView() {
     setSuggestion(null)
   }
 
+  // Geolocation helper
+  const useMyLocation = async () => {
+    if (!('geolocation' in navigator)) return
+    navigator.geolocation.getCurrentPosition((pos) => {
+      const { latitude, longitude } = pos.coords
+      setStart([latitude, longitude])
+    })
+  }
+
+  // Click selection handler
+  const handleMapSet = useCallback((latlng) => {
+    if (selectionMode === 'start') setStart(latlng)
+    else if (selectionMode === 'end') setEnd(latlng)
+  }, [selectionMode])
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4">
-      <div className="relative h-[560px] lg:h-[680px] rounded-xl overflow-hidden shadow ring-1 ring-slate-200">
+      <div className="relative h[560px] lg:h-[680px] rounded-xl overflow-hidden shadow ring-1 ring-slate-200">
         <MapContainer center={[37.7755, -122.418]} zoom={14} scrollWheelZoom className="h-full w-full">
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
 
-          <Marker position={start}>
+          {/* Map click to set start/end depending on selection mode */}
+          {selectionMode !== 'none' && <ClickSetter onSet={handleMapSet} />}
+
+          <Marker position={start} draggable={true} eventHandlers={{ dragend: (e) => {
+            const ll = e.target.getLatLng();
+            setStart([ll.lat, ll.lng])
+          }}}>
             <Popup>Start</Popup>
           </Marker>
-          <Marker position={end}>
+          <Marker position={end} draggable={true} eventHandlers={{ dragend: (e) => {
+            const ll = e.target.getLatLng();
+            setEnd([ll.lat, ll.lng])
+          }}}>
             <Popup>Destination</Popup>
           </Marker>
 
@@ -585,10 +621,10 @@ export default function MapView() {
           {/* Lane guidance hints */}
           <LaneGuidance path={active.path} />
 
-          {/* Fit bounds to active route */}
-          <FitBounds path={active.path} />
+          {/* Fit bounds to active route + user-selected points */}
+          <FitBounds path={active.path} extraPoints={[start, end]} />
 
-          {/* Simulated user position */}
+          {/* Simulated user position along route */}
           <Marker position={active.path[Math.min(progress.idx, active.path.length - 1)]}>
             <Popup>You are here (simulated)</Popup>
           </Marker>
@@ -618,9 +654,44 @@ export default function MapView() {
           ))}
         </div>
 
-        {/* Live alert suggestions */}
-        {suggestion && (
-          <div className="absolute top-3 right-3 z-[700] max-w-xs">
+        {/* Start/End picking toolbar */}
+        <div className="absolute top-3 right-3 z-[700] max-w-xs space-y-2">
+          <div className="bg-white/95 border border-slate-200 rounded-lg shadow p-3">
+            <div className="text-sm font-semibold mb-2">Pick locations</div>
+            <div className="flex gap-2">
+              <button
+                aria-label="Select start on map"
+                onClick={() => setSelectionMode(selectionMode === 'start' ? 'none' : 'start')}
+                className={`px-3 py-1.5 rounded-md text-sm border ${selectionMode==='start' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-700'}`}
+              >
+                Set Start
+              </button>
+              <button
+                aria-label="Select destination on map"
+                onClick={() => setSelectionMode(selectionMode === 'end' ? 'none' : 'end')}
+                className={`px-3 py-1.5 rounded-md text-sm border ${selectionMode==='end' ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-slate-700'}`}
+              >
+                Set End
+              </button>
+            </div>
+            <div className="flex items-center gap-2 mt-2">
+              <button className="text-xs px-2 py-1 rounded border" onClick={useMyLocation}>Use my location</button>
+              <button className="text-xs px-2 py-1 rounded border" onClick={() => setSelectionMode('none')}>Done</button>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mt-2 text-xs text-slate-600">
+              <div>
+                <div>Start</div>
+                <div className="font-mono">{start[0].toFixed(5)}, {start[1].toFixed(5)}</div>
+              </div>
+              <div>
+                <div>End</div>
+                <div className="font-mono">{end[0].toFixed(5)}, {end[1].toFixed(5)}</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Live alert suggestions */}
+          {suggestion && (
             <div className="bg-white/95 border border-slate-200 rounded-lg shadow p-3">
               <div className="text-sm font-semibold">Conditions changed</div>
               <div className="text-xs text-slate-600 mt-1">We found a better route.</div>
@@ -641,8 +712,8 @@ export default function MapView() {
                 </button>
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Legend */}
         <div className="absolute bottom-3 left-3 z-[700] bg-white/90 backdrop-blur border border-slate-200 rounded-lg p-3 text-sm text-slate-700 shadow">
@@ -659,16 +730,16 @@ export default function MapView() {
         <div className="absolute bottom-3 right-3 z-[700] bg-white/95 backdrop-blur border border-slate-200 rounded-lg p-3 text-sm text-slate-700 shadow w-[260px]">
           <div className="font-semibold mb-2">Preferences</div>
           <label className="block text-xs text-slate-500">Avoid busy roads: {(prefs.avoidBusy*100).toFixed(0)}%</label>
-          <input type="range" min="0" max="1" step="0.05" value={prefs.avoidBusy} onChange={(e)=>setPrefs((p)=>({ ...p, avoidBusy: parseFloat(e.target.value) }))} className="w-full" />
+          <input aria-label="Avoid busy roads" type="range" min="0" max="1" step="0.05" value={prefs.avoidBusy} onChange={(e)=>setPrefs((p)=>({ ...p, avoidBusy: parseFloat(e.target.value) }))} className="w-full" />
           <label className="block text-xs text-slate-500 mt-2">Prefer well-lit streets: {(prefs.preferLit*100).toFixed(0)}%</label>
-          <input type="range" min="0" max="1" step="0.05" value={prefs.preferLit} onChange={(e)=>setPrefs((p)=>({ ...p, preferLit: parseFloat(e.target.value) }))} className="w-full" />
+          <input aria-label="Prefer well-lit streets" type="range" min="0" max="1" step="0.05" value={prefs.preferLit} onChange={(e)=>setPrefs((p)=>({ ...p, preferLit: parseFloat(e.target.value) }))} className="w-full" />
           <label className="block text-xs text-slate-500 mt-2">Comfort level</label>
           <div className="flex items-center gap-2">
-            <input type="range" min="0" max="1" step="0.25" value={prefs.comfort} onChange={(e)=>setPrefs((p)=>({ ...p, comfort: parseFloat(e.target.value) }))} className="w-full" />
+            <input aria-label="Comfort level" type="range" min="0" max="1" step="0.25" value={prefs.comfort} onChange={(e)=>setPrefs((p)=>({ ...p, comfort: parseFloat(e.target.value) }))} className="w-full" />
             <span className="text-xs w-14 text-right">{prefs.comfort < 0.34 ? 'Low' : prefs.comfort < 0.67 ? 'Medium' : 'High'}</span>
           </div>
           <label className="block text-xs text-slate-500 mt-3">Predict next (min): {horizon}</label>
-          <input type="range" min="5" max="30" step="5" value={horizon} onChange={(e)=>setHorizon(parseInt(e.target.value))} className="w-full" />
+          <input aria-label="Prediction horizon" type="range" min="5" max="30" step="5" value={horizon} onChange={(e)=>setHorizon(parseInt(e.target.value))} className="w-full" />
           <div className="flex items-center justify-between mt-2">
             <button className={`text-xs px-2 py-1 rounded border ${simOn ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white'}`} onClick={()=>setSimOn((v)=>!v)}>
               {simOn ? 'Sim ON' : 'Sim OFF'}
